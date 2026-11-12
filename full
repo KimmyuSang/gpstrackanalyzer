@@ -1,0 +1,186 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <cmath>
+#include <iomanip>
+
+using namespace std;
+
+const double EARTH_RADIUS_M = 6371000.0;
+const double MAX_VALID_SPEED_MPS = 50.0; // ~112 mph threshold for GPS glitches
+const double PI = 3.14159265358979323846;
+
+struct TrackPoint {
+    double lat;
+    double lon;
+    double elev;
+    double time;
+};
+
+// Convert degrees to radians
+double toRadians(double degrees) {
+    return degrees * PI / 180.0;
+}
+
+// Calculate 2D surface distance in meters between two GPS coordinates
+double haversineDistance(const TrackPoint& p1, const TrackPoint& p2) {
+    double dLat = toRadians(p2.lat - p1.lat);
+    double dLon = toRadians(p2.lon - p1.lon);
+
+    double lat1 = toRadians(p1.lat);
+    double lat2 = toRadians(p2.lat);
+
+    double a = sin(dLat / 2) * sin(dLat / 2) +
+               cos(lat1) * cos(lat2) * sin(dLon / 2) * sin(dLon / 2);
+    double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+
+    return EARTH_RADIUS_M * c;
+}
+
+// Milestone 1: Read raw GPS points from CSV
+vector<TrackPoint> readCSV(const string& filename) {
+    vector<TrackPoint> points;
+    ifstream file(filename);
+    
+    if (!file.is_open()) {
+        cerr << "Error: Could not open " << filename << "\n";
+        return points;
+    }
+
+    string line;
+    getline(file, line); // Skip header row
+
+    while (getline(file, line)) {
+        if (line.empty()) continue;
+        stringstream ss(line);
+        string item;
+        TrackPoint pt;
+
+        getline(ss, item, ','); pt.lat = stod(item);
+        getline(ss, item, ','); pt.lon = stod(item);
+        getline(ss, item, ','); pt.elev = stod(item);
+        getline(ss, item, ','); pt.time = stod(item);
+
+        points.push_back(pt);
+    }
+
+    return points;
+}
+
+// Milestone 2 & 3: Remove GPS spikes based on unrealistic speed jumps
+vector<TrackPoint> filterOutliers(const vector<TrackPoint>& rawPoints) {
+    if (rawPoints.empty()) return {};
+
+    vector<TrackPoint> cleaned;
+    cleaned.push_back(rawPoints[0]); // Keep starting point
+
+    for (size_t i = 1; i < rawPoints.size(); ++i) {
+        const TrackPoint& lastValid = cleaned.back();
+        const TrackPoint& current = rawPoints[i];
+
+        double dist = haversineDistance(lastValid, current);
+        double dt = current.time - lastValid.time;
+
+        if (dt <= 0) continue; // Skip duplicate timestamps
+
+        double speed = dist / dt;
+        if (speed <= MAX_VALID_SPEED_MPS) {
+            cleaned.push_back(current);
+        } else {
+            cout << "[Filter] Removed outlier at time " << current.time 
+                 << "s (Speed: " << fixed << setprecision(1) << speed << " m/s)\n";
+        }
+    }
+
+    return cleaned;
+}
+
+// Milestone 4: Export cleaned track as a GeoJSON FeatureCollection
+bool exportGeoJSON(const vector<TrackPoint>& points, const string& outFilename, 
+                   double totalDist, double elevGain) {
+    ofstream out(outFilename);
+    if (!out.is_open()) {
+        cerr << "Error: Could not write to " << outFilename << "\n";
+        return false;
+    }
+
+    out << fixed << setprecision(6);
+    out << "{\n";
+    out << "  \"type\": \"FeatureCollection\",\n";
+    out << "  \"features\": [\n";
+    out << "    {\n";
+    out << "      \"type\": \"Feature\",\n";
+    out << "      \"properties\": {\n";
+    out << "        \"name\": \"Cleaned GPS Route\",\n";
+    out << "        \"distance_m\": " << setprecision(2) << totalDist << ",\n";
+    out << "        \"elev_gain_m\": " << setprecision(2) << elevGain << ",\n";
+    out << "        \"point_count\": " << points.size() << "\n";
+    out << "      },\n";
+    out << "      \"geometry\": {\n";
+    out << "        \"type\": \"LineString\",\n";
+    out << "        \"coordinates\": [\n";
+
+    // GeoJSON standard requires [longitude, latitude, elevation] order
+    out << setprecision(6);
+    for (size_t i = 0; i < points.size(); ++i) {
+        out << "          [" << points[i].lon << ", " 
+            << points[i].lat << ", " 
+            << setprecision(1) << points[i].elev << "]";
+        if (i < points.size() - 1) out << ",";
+        out << "\n" << setprecision(6);
+    }
+
+    out << "        ]\n";
+    out << "      }\n";
+    out << "    }\n";
+    out << "  ]\n";
+    out << "}\n";
+
+    return true;
+}
+
+int main() {
+    string inputFile = "track.csv";
+    string outputFile = "cleaned_track.geojson";
+
+    cout << "=== C++ GPS Track Analyzer ===\n";
+    vector<TrackPoint> rawPoints = readCSV(inputFile);
+    if (rawPoints.size() < 2) {
+        cerr << "Not enough valid points to process.\n";
+        return 1;
+    }
+
+    cout << "Loaded " << rawPoints.size() << " raw points.\n";
+    vector<TrackPoint> cleanPoints = filterOutliers(rawPoints);
+
+    // Compute final summary statistics
+    double totalDistance = 0.0;
+    double elevationGain = 0.0;
+
+    for (size_t i = 1; i < cleanPoints.size(); ++i) {
+        totalDistance += haversineDistance(cleanPoints[i - 1], cleanPoints[i]);
+        double dElev = cleanPoints[i].elev - cleanPoints[i - 1].elev;
+        if (dElev > 0) {
+            elevationGain += dElev;
+        }
+    }
+
+    double totalTime = cleanPoints.back().time - cleanPoints.front().time;
+    double avgSpeed = (totalTime > 0) ? (totalDistance / totalTime) : 0.0;
+
+    cout << "\n--- Summary Report ---\n";
+    cout << fixed << setprecision(2);
+    cout << "Valid Points:    " << cleanPoints.size() << "\n";
+    cout << "Total Distance:  " << totalDistance << " meters\n";
+    cout << "Elevation Gain:  " << elevationGain << " meters\n";
+    cout << "Average Speed:   " << avgSpeed << " m/s\n";
+
+    if (exportGeoJSON(cleanPoints, outputFile, totalDistance, elevationGain)) {
+        cout << "\nSuccess! Exported GeoJSON to '" << outputFile << "'.\n";
+        cout << "Ready to import into ArcGIS Pro using 'JSON To Features'.\n";
+    }
+
+    return 0;
+}
